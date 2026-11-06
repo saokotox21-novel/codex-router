@@ -47,6 +47,7 @@ import { activityMetadataFromHeaders } from "./codex-session-names.mjs";
 import { translateGatewayError } from "./error-translation.mjs";
 import { recordUsageEvent } from "./usage-events.mjs";
 import {
+  boundImagePayload,
   describeImage,
   evidenceCache,
   inputHasImage,
@@ -731,6 +732,7 @@ async function visionEvidenceFor(url, engine, signal) {
 // operator already enabled. Turns without images cost nothing here, and a
 // model that reads images itself is never touched.
 async function bridgeVisionInput(input, route, signal) {
+  input = boundImagePayload(input).input;
   if (!inputHasImage(input)) return input;
   if (supportsImageInput(route)) return input;
   if (route.visionBridge === false) {

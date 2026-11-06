@@ -149,13 +149,118 @@ function imageUrlOf(part) {
   return undefined;
 }
 
+// A pasted screenshot lives in a message's `content`; a `view_image` result
+// lives in a function_call_output's `output`. Both are content-part arrays and
+// both are replayed on every turn, so neither can be skipped.
+function imagePartsField(item) {
+  if (Array.isArray(item?.content)) return "content";
+  if (Array.isArray(item?.output)) return "output";
+  return undefined;
+}
+
+function collapseOutputParts(parts) {
+  const text = [];
+  for (const part of parts) {
+    if (
+      part?.type !== "input_text" &&
+      part?.type !== "text"
+    ) return parts;
+    if (typeof part.text !== "string") return parts;
+    text.push(part.text);
+  }
+  return text.join("\n");
+}
+
+const IMAGE_PAYLOAD_BUDGET_BYTES = 20 * 1024 * 1024;
+const IMAGE_PAYLOAD_BUDGET_COUNT = 32;
+const IMAGE_PAYLOAD_KEEP_NEWEST = 2;
+const IMAGE_BUDGET_RECEIPT =
+  "[image omitted by Codex Router: this conversation carried more image " +
+  "content than one provider request should hold. Re-capture the screen if " +
+  "you need it again.]";
+
+function dataUrlDecodedBytes(url) {
+  if (typeof url !== "string" || !/^data:image\//i.test(url)) return 0;
+  const comma = url.indexOf(",");
+  if (comma === -1) return 0;
+  return Math.floor(((url.length - comma - 1) * 3) / 4);
+}
+
+// Bound the image history before the vision bridge reads it. A long session
+// replays every screenshot it still holds, and both Codex's compressed request
+// and the provider's body limit apply to that replay. Keep the newest images
+// the turn is actually about and replace older ones with a receipt.
+export function boundImagePayload(input, {
+  maxBytes = IMAGE_PAYLOAD_BUDGET_BYTES,
+  maxImages = IMAGE_PAYLOAD_BUDGET_COUNT,
+  keepNewest = IMAGE_PAYLOAD_KEEP_NEWEST,
+} = {}) {
+  if (!Array.isArray(input)) return { input, imagesDropped: 0 };
+  const references = [];
+  for (let itemIndex = 0; itemIndex < input.length; itemIndex += 1) {
+    const field = imagePartsField(input[itemIndex]);
+    if (field === undefined) continue;
+    for (let partIndex = 0; partIndex < input[itemIndex][field].length; partIndex += 1) {
+      const url = imageUrlOf(input[itemIndex][field][partIndex]);
+      if (url === undefined) continue;
+      references.push({
+        itemIndex,
+        field,
+        partIndex,
+        bytes: dataUrlDecodedBytes(url),
+      });
+    }
+  }
+
+  let totalBytes = references.reduce((total, reference) => total + reference.bytes, 0);
+  if (
+    totalBytes <= maxBytes &&
+    references.length <= maxImages
+  ) return { input, imagesDropped: 0 };
+
+  const protectedCount = Math.max(0, Math.min(keepNewest, references.length));
+  const droppable = references.slice(0, references.length - protectedCount);
+  const dropped = new Set();
+  let remainingImages = references.length;
+  for (const reference of droppable) {
+    if (totalBytes <= maxBytes && remainingImages <= maxImages) break;
+    dropped.add(reference);
+    totalBytes -= reference.bytes;
+    remainingImages -= 1;
+  }
+  if (dropped.size === 0) return { input, imagesDropped: 0 };
+
+  const byItem = new Map();
+  for (const reference of dropped) {
+    if (!byItem.has(reference.itemIndex)) byItem.set(reference.itemIndex, []);
+    byItem.get(reference.itemIndex).push(reference);
+  }
+  const output = input.map((item, itemIndex) => {
+    const hits = byItem.get(itemIndex);
+    if (!hits) return item;
+    const field = imagePartsField(item);
+    const indexes = new Set(
+      hits.filter((hit) => hit.field === field).map((hit) => hit.partIndex),
+    );
+    const parts = item[field].map((part, partIndex) =>
+      indexes.has(partIndex)
+        ? { type: "input_text", text: IMAGE_BUDGET_RECEIPT }
+        : part);
+    return {
+      ...item,
+      [field]: field === "output" ? collapseOutputParts(parts) : parts,
+    };
+  });
+  return { input: output, imagesDropped: dropped.size };
+}
+
 export function inputHasImage(input) {
   if (!Array.isArray(input)) return false;
-  return input.some(
-    (item) =>
-      Array.isArray(item?.content) &&
-      item.content.some((part) => imageUrlOf(part) !== undefined),
-  );
+  return input.some((item) => {
+    const field = imagePartsField(item);
+    return field !== undefined &&
+      item[field].some((part) => imageUrlOf(part) !== undefined);
+  });
 }
 
 // The described text is data the router pulled out of a user-supplied picture,
@@ -347,12 +452,13 @@ export async function substituteImages(input, describe) {
   let failed = 0;
   const output = [];
   for (const item of input) {
-    if (!Array.isArray(item?.content) || !item.content.some((part) => imageUrlOf(part))) {
+    const field = imagePartsField(item);
+    if (field === undefined || !item[field].some((part) => imageUrlOf(part))) {
       output.push(item);
       continue;
     }
     const content = [];
-    for (const part of item.content) {
+    for (const part of item[field]) {
       const url = imageUrlOf(part);
       if (url === undefined) {
         content.push(part);
@@ -377,7 +483,10 @@ export async function substituteImages(input, describe) {
         });
       }
     }
-    output.push({ ...item, content });
+    output.push({
+      ...item,
+      [field]: field === "output" ? collapseOutputParts(content) : content,
+    });
   }
   return { input: output, images: ordinal, described, failed };
 }
@@ -389,15 +498,19 @@ export function stripImages(input, reason) {
   if (!Array.isArray(input)) return { input, images: 0 };
   let ordinal = 0;
   const output = input.map((item) => {
-    if (!Array.isArray(item?.content) || !item.content.some((part) => imageUrlOf(part))) {
+    const field = imagePartsField(item);
+    if (field === undefined || !item[field].some((part) => imageUrlOf(part))) {
       return item;
     }
-    const content = item.content.map((part) => {
+    const content = item[field].map((part) => {
       if (imageUrlOf(part) === undefined) return part;
       ordinal += 1;
       return { type: "input_text", text: unreadableBlock({ ordinal, reason }) };
     });
-    return { ...item, content };
+    return {
+      ...item,
+      [field]: field === "output" ? collapseOutputParts(content) : content,
+    };
   });
   return { input: output, images: ordinal };
 }

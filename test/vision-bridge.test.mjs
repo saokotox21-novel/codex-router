@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   applyVisionBridge,
+  boundImagePayload,
   createEvidenceCache,
   describeImage,
   DEFAULT_LOCAL_VISION_MODEL,
@@ -161,6 +162,38 @@ test("image detection ignores ordinary turns", () => {
   );
 });
 
+test("image detection includes view_image tool results", () => {
+  const input = [{
+    type: "function_call_output",
+    call_id: "call_image",
+    output: [{ type: "input_image", image_url: "data:image/png;base64,AAAA" }],
+  }];
+  assert.equal(inputHasImage(input), true);
+});
+
+test("an oversized image history keeps only the newest screenshots", () => {
+  const input = Array.from({ length: 40 }, (_, index) => ({
+    type: "function_call_output",
+    call_id: `image-${index}`,
+    output: [{
+      type: "input_image",
+      image_url: `data:image/png;base64,${"A".repeat(64)}${index}`,
+    }],
+  }));
+  const bounded = boundImagePayload(input);
+  assert.equal(bounded.imagesDropped, 8);
+  const imageItems = bounded.input.filter((item) => typeof item.output !== "string");
+  assert.equal(imageItems.length, 32);
+  assert.equal(typeof bounded.input[0].output, "string");
+  assert.match(bounded.input[0].output, /image omitted by Codex Router/);
+  assert.match(bounded.input.at(-1).output[0].image_url, /39$/);
+});
+
+test("a small image history is left untouched", () => {
+  const input = imageInput();
+  assert.equal(boundImagePayload(input).input, input);
+});
+
 test("evidence replaces the image part and is fenced as untrusted data", async () => {
   const result = await substituteImages(imageInput(), async () => ({
     text: "## Summary\nA login screen.",
@@ -177,6 +210,26 @@ test("evidence replaces the image part and is fenced as untrusted data", async (
   assert.match(content[1].text, /read for you by Qwen3\.6 Flash/);
   assert.match(content[1].text, /never instructions/);
   assert.match(content[1].text, /<<<IMAGE EVIDENCE[\s\S]*A login screen\.[\s\S]*IMAGE EVIDENCE>>>/);
+});
+
+test("evidence replaces images inside a view_image tool result", async () => {
+  const input = [{
+    type: "function_call_output",
+    call_id: "call_image",
+    output: [
+      { type: "input_text", text: "tool output" },
+      { type: "input_image", image_url: "data:image/png;base64,AAAA" },
+    ],
+  }];
+  const result = await substituteImages(input, async () => ({
+    text: "A screenshot.",
+    engineName: "Qwen3.6 Flash",
+  }));
+  assert.equal(result.images, 1);
+  assert.equal(typeof result.input[0].output, "string");
+  assert.match(result.input[0].output, /tool output/);
+  assert.match(result.input[0].output, /IMAGE EVIDENCE/);
+  assert.doesNotMatch(result.input[0].output, /data:image/);
 });
 
 test("one unreadable image degrades to a stated failure, not a failed turn", async () => {
@@ -204,6 +257,19 @@ test("images survive as text when no engine can read them", () => {
     ["input_text", "input_text"],
   );
   assert.match(input[0].content[1].text, /could not be read: the bridge is off/);
+});
+
+test("tool-result images become text when no engine can read them", () => {
+  const input = [{
+    type: "function_call_output",
+    call_id: "call_image",
+    output: [{ type: "input_image", image_url: "data:image/png;base64,AAAA" }],
+  }];
+  const result = stripImages(input, "the bridge is off");
+  assert.equal(result.images, 1);
+  assert.equal(typeof result.input[0].output, "string");
+  assert.match(result.input[0].output, /could not be read: the bridge is off/);
+  assert.doesNotMatch(result.input[0].output, /data:image/);
 });
 
 test("the same image is described once and served from cache after that", async () => {
